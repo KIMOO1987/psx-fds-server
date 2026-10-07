@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  psx-fds-server:
+    build: .
+    container_name: psx_fds_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-AdminPSX2026!}
+      - SECRET_KEY=${SECRET_KEY:-psx_super_secret_jwt_key_2026_xyz}
+      - DATA_DIR=/app/data
+    volumes:
+      - psx_data:/app/data
+
+volumes:
+  psx_data:
+    driver: local
