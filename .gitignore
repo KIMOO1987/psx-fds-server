@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.local
+
+# Database files (database is created automatically in /app/data on server)
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# OS files
+Thumbs.db
+.DS_Store
