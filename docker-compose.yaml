@@ -13,7 +13,13 @@ services:
       - DATA_DIR=/app/data
     volumes:
       - psx_data:/app/data
+    networks:
+      - coolify
 
 volumes:
   psx_data:
     driver: local
+
+networks:
+  coolify:
+    external: true
