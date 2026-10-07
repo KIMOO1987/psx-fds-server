@@ -324,10 +324,23 @@ def scan_official_psx_market():
     except Exception:
         pass
 
+    # 1. Load full 500+ PSX universe dataset
+    universe_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psx_full_universe.json")
+    all_universe_stocks = []
+    if os.path.exists(universe_file):
+        try:
+            with open(universe_file, "r", encoding="utf-8") as f:
+                all_universe_stocks = json.load(f)
+        except Exception as e:
+            print(f"[-] Error loading universe file: {e}")
+
     evaluated = []
     charts_data = {}
+    audited_symbols = list(PSX_COMPANIES.keys())
 
-    for sym, data in PSX_COMPANIES.items():
+    # 2. Fetch real DPS EOD chart candles for primary audited companies
+    for sym in audited_symbols:
+        data = PSX_COMPANIES[sym]
         live_price = None
         bars = []
         try:
@@ -366,10 +379,7 @@ def scan_official_psx_market():
         graham_num = round(math.sqrt(22.5 * data["eps_cur"] * bvps), 1) if data["eps_cur"] > 0 and bvps > 0 else None
         graham_margin = round(((graham_num - price_used) / price_used * 100), 1) if graham_num else None
         
-        # Determine Trade Setup
         latest_c = bars[-1]["close"] if bars else price_used
-        s20_v = sma20[-1]["value"] if sma20 else latest_c
-        s50_v = sma50[-1]["value"] if sma50 else latest_c
         
         if sym in ["FFC", "SYS", "MEBL", "MCB", "UBL", "MARI", "INDU"]:
             action = "VALUE BUY" if (graham_margin and graham_margin > 15) else "ACCUMULATE"
@@ -408,7 +418,6 @@ def scan_official_psx_market():
             "rationale": f"Official PSX trade signal. Fundamental Score: {score}/10."
         }
 
-        # Chart Markers
         markers = []
         if len(bars) > 10:
             markers.append({"time": bars[-1]["time"], "position": "belowBar", "color": "#10b981", "shape": "arrowUp", "text": action})
@@ -444,10 +453,16 @@ def scan_official_psx_market():
         evaluated.append(stock_record)
         charts_data[sym] = {"bars": bars, "sma20": sma20, "sma50": sma50, "markers": markers, "trade_setup": trade_setup}
 
+    # 3. Incorporate all other 500+ stocks from the PSX full universe
+    audited_set = set(audited_symbols)
+    for u_stock in all_universe_stocks:
+        if u_stock["symbol"] not in audited_set:
+            evaluated.append(u_stock)
+
     _market_cache["last_scanned"] = datetime.datetime.now(datetime.timezone.utc).strftime("%d-%b-%Y %H:%M:%S UTC")
     _market_cache["stocks"] = sorted(evaluated, key=lambda x: x["overall_score"], reverse=True)
     _market_cache["charts"] = charts_data
-    print(f"[+] Market scan complete: {len(evaluated)} PSX symbols cached.")
+    print(f"[+] Market scan complete: {len(evaluated)} PSX symbols cached (All {len(evaluated)} active stocks).")
 
 # Run scan on server boot
 scan_official_psx_market()
@@ -1032,6 +1047,56 @@ async def client_market_data(authorization: Optional[str] = Header(None)):
         "charts": _market_cache["charts"],
         "user": user_info
     }
+
+@app.get("/api/chart/{symbol}")
+async def get_stock_chart(symbol: str):
+    sym = symbol.upper().strip()
+    if sym in _market_cache["charts"]:
+        return {"status": "success", "chart": _market_cache["charts"][sym]}
+    
+    # Try fetching on-demand from DPS timeseries
+    try:
+        s = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://dps.psx.com.pk/"
+        }
+        r = s.get("https://dps.psx.com.pk/", headers=headers, timeout=5)
+        m = re.search(r'window\.__ps\s*=\s*({[^}]+})', r.text)
+        if m:
+            token = json.loads(m.group(1)).get("_k")
+            s.headers.update({"X-Req-Id": token})
+            r_ts = s.get(f"https://dps.psx.com.pk/timeseries/eod/{sym}", timeout=6)
+            if r_ts.status_code == 200:
+                raw = r_ts.json().get("data", [])
+                if raw:
+                    bars = []
+                    for d in raw[:160]:
+                        dt = datetime.datetime.fromtimestamp(d[0], datetime.timezone.utc).strftime("%Y-%m-%d")
+                        close_p = round(float(d[1]), 2)
+                        vol = int(d[2] or 0)
+                        open_p = round(float(d[3] if len(d) > 3 and d[3] is not None else d[1]), 2)
+                        spread = abs(close_p - open_p) * 0.35
+                        high_p = round(max(open_p, close_p) + max(spread, close_p * 0.005), 2)
+                        low_p = round(min(open_p, close_p) - max(spread, close_p * 0.005), 2)
+                        bars.append({"time": dt, "open": open_p, "high": high_p, "low": low_p, "close": close_p, "volume": vol})
+                    bars = sorted(bars, key=lambda x: x["time"])
+                    
+                    sma20, sma50 = [], []
+                    closes = [b["close"] for b in bars]
+                    for i in range(len(bars)):
+                        if i >= 19: sma20.append({"time": bars[i]["time"], "value": round(sum(closes[i-19:i+1])/20.0, 2)})
+                        if i >= 49: sma50.append({"time": bars[i]["time"], "value": round(sum(closes[i-49:i+1])/50.0, 2)})
+                    
+                    chart_obj = {"bars": bars, "sma20": sma20, "sma50": sma50, "markers": []}
+                    _market_cache["charts"][sym] = chart_obj
+                    return {"status": "success", "chart": chart_obj}
+    except Exception:
+        pass
+
+    return {"status": "not_found", "message": f"Chart not found for {sym}"}
 
 # ────────────────────────────────────────────────────────────────────
 # 8. ROOT HEALTH CHECK ROUTE
