@@ -931,6 +931,42 @@ class LoginRequest(BaseModel):
 @app.post("/api/login")
 async def client_login(payload: LoginRequest):
     email = payload.email.lower().strip()
+
+    # 1. Direct Master Admin Login Bypass
+    if (email == ADMIN_USER.lower() or email == f"{ADMIN_USER.lower()}@crtalgo.online") and payload.password == ADMIN_PASSWORD:
+        token = "admin_" + secrets.token_urlsafe(32)
+        with get_db() as conn:
+            admin_row = conn.execute("SELECT id FROM users WHERE email = 'admin@crtalgo.online'").fetchone()
+            if not admin_row:
+                p_hash, salt = hash_password(ADMIN_PASSWORD)
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                exp_iso = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)).isoformat()
+                cur = conn.execute(
+                    "INSERT INTO users (email, name, password_hash, salt, plan, created_at, expires_at, is_active, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ('admin@crtalgo.online', 'Master Administrator', p_hash, salt, 'Lifetime Master', now_iso, exp_iso, 1, 'Auto-provisioned Admin Account')
+                )
+                admin_id = cur.lastrowid
+            else:
+                admin_id = admin_row["id"]
+
+            token_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
+            conn.execute("INSERT INTO client_tokens (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                         (token, admin_id, datetime.datetime.now(datetime.timezone.utc).isoformat(), token_exp.isoformat()))
+            conn.commit()
+
+        return {
+            "status": "success",
+            "token": token,
+            "user": {
+                "email": ADMIN_USER,
+                "name": "Master Administrator",
+                "plan": "Lifetime Master",
+                "expires_at": "Lifetime",
+                "days_left": 9999
+            }
+        }
+
+    # 2. Standard Client License Authentication
     with get_db() as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
         if not row:
