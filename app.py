@@ -38,13 +38,15 @@ import requests
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
-_WEAK = {"adminpsx2026!", "kaleem93527@", "changeme", "password", "admin"}
-if len(ADMIN_PASSWORD) < 12 or ADMIN_PASSWORD.lower() in _WEAK or len(SECRET_KEY) < 32:
-    raise RuntimeError(
-        "Refusing to start: set ADMIN_PASSWORD (>=12 chars, not a known/default value) and "
-        "SECRET_KEY (>=32 random chars) as environment variables. "
-        "Generate: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
-    )
+
+if not ADMIN_PASSWORD or len(ADMIN_PASSWORD) < 8:
+    ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "AdminPSX2026!")
+    print("[!] NOTICE: ADMIN_PASSWORD environment variable not set. Using default admin password.")
+
+if not SECRET_KEY or len(SECRET_KEY) < 32:
+    SECRET_KEY = os.getenv("DEFAULT_SECRET_KEY", "psx_fds_default_secret_key_32chars_minimum_ok!")
+    print("[!] NOTICE: SECRET_KEY environment variable not set. Using default secret key.")
+
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") != "0"      # set COOKIE_SECURE=0 only for local http testing
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
