@@ -36,8 +36,17 @@ import requests
 # 1. ENVIRONMENT & PERSISTENT STORAGE CONFIGURATION
 # ────────────────────────────────────────────────────────────────────
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "AdminPSX2026!")
-SECRET_KEY = os.getenv("SECRET_KEY", "psx_fds_super_secret_key_2026_xyz_auth")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+_WEAK = {"adminpsx2026!", "kaleem93527@", "changeme", "password", "admin"}
+if len(ADMIN_PASSWORD) < 12 or ADMIN_PASSWORD.lower() in _WEAK or len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        "Refusing to start: set ADMIN_PASSWORD (>=12 chars, not a known/default value) and "
+        "SECRET_KEY (>=32 random chars) as environment variables. "
+        "Generate: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+    )
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") != "0"      # set COOKIE_SECURE=0 only for local http testing
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -48,8 +57,8 @@ app = FastAPI(title="PSX FDS Pro Production Server", version="3.2.0")
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,          # empty by default: the desktop client does not need CORS
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -106,6 +115,28 @@ init_db()
 # ────────────────────────────────────────────────────────────────────
 # 3. SECURITY & CRYPTO HELPERS
 # ────────────────────────────────────────────────────────────────────
+import time as _time
+import html as _html
+from collections import defaultdict as _dd
+
+_FAILS = _dd(list)                       # key -> [timestamps of recent failures]
+_MAX_FAILS, _WINDOW = 5, 15 * 60
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")       # behind Coolify/Traefik
+    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown"))
+
+def _locked(key: str) -> bool:
+    now = _time.time()
+    _FAILS[key] = [x for x in _FAILS[key] if now - x < _WINDOW]
+    return len(_FAILS[key]) >= _MAX_FAILS
+
+def _fail(key: str) -> None:
+    _FAILS[key].append(_time.time())
+
+def _same(a: str, b: str) -> bool:
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
     if not salt:
         salt = secrets.token_hex(16)
@@ -138,7 +169,7 @@ def create_admin_session(response: Response) -> str:
         conn.execute("INSERT INTO admin_sessions (session_id, created_at, expires_at) VALUES (?, ?, ?)",
                      (session_id, datetime.datetime.now(datetime.timezone.utc).isoformat(), exp.isoformat()))
         conn.commit()
-    response.set_cookie(key="psx_admin_session", value=session_id, max_age=86400*7, httponly=True, samesite="lax")
+    response.set_cookie(key="psx_admin_session", value=session_id, max_age=86400*7, httponly=True, secure=COOKIE_SECURE, samesite="strict")
     return session_id
 
 def verify_client_token(token: str) -> Optional[dict]:
@@ -307,164 +338,25 @@ _market_cache = {
 }
 
 def scan_official_psx_market():
-    print("[*] Initiating scan via official PSX Data Portal (dps.psx.com.pk)...")
-    s = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://dps.psx.com.pk/company/FFC"
-    }
-    try:
-        r = s.get("https://dps.psx.com.pk/company/FFC", headers=headers, timeout=8)
-        m = re.search(r'window\.__ps\s*=\s*({[^}]+})', r.text)
-        if m:
-            token = json.loads(m.group(1)).get("_k")
-            s.headers.update({"X-Req-Id": token})
-    except Exception:
-        pass
-
-    # 1. Load full 500+ PSX universe dataset
+    """v4: the server no longer scores anything itself. It serves psx_full_universe.json,
+    produced by build_universe.py (real price history + trade_engine). Charts are fetched
+    on demand by /api/chart/{symbol}."""
     universe_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psx_full_universe.json")
-    all_universe_stocks = []
+    stocks = []
     if os.path.exists(universe_file):
         try:
             with open(universe_file, "r", encoding="utf-8") as f:
-                all_universe_stocks = json.load(f)
+                stocks = json.load(f)
         except Exception as e:
             print(f"[-] Error loading universe file: {e}")
-
-    evaluated = []
-    charts_data = {}
-    audited_symbols = list(PSX_COMPANIES.keys())
-
-    # 2. Fetch real DPS EOD chart candles for primary audited companies
-    for sym in audited_symbols:
-        data = PSX_COMPANIES[sym]
-        live_price = None
-        bars = []
-        try:
-            r = s.get(f"https://dps.psx.com.pk/timeseries/eod/{sym}", timeout=8)
-            if r.status_code == 200:
-                raw = r.json().get("data", [])
-                if raw:
-                    live_price = float(raw[0][1])
-                    for d in raw[:160]:
-                        dt = datetime.datetime.fromtimestamp(d[0], datetime.timezone.utc).strftime("%Y-%m-%d")
-                        close_p = round(float(d[1]), 2)
-                        vol = int(d[2] or 0)
-                        open_p = round(float(d[3] if len(d) > 3 and d[3] is not None else d[1]), 2)
-                        spread = abs(close_p - open_p) * 0.35
-                        high_p = round(max(open_p, close_p) + max(spread, close_p * 0.005), 2)
-                        low_p = round(min(open_p, close_p) - max(spread, close_p * 0.005), 2)
-                        bars.append({"time": dt, "open": open_p, "high": high_p, "low": low_p, "close": close_p, "volume": vol})
-                    bars = sorted(bars, key=lambda x: x["time"])
-        except Exception:
-            pass
-
-        price_used = live_price if live_price else data["default_price"]
-        
-        # Calculate moving averages
-        sma20, sma50 = [], []
-        closes = [b["close"] for b in bars]
-        for i in range(len(bars)):
-            if i >= 19: sma20.append({"time": bars[i]["time"], "value": round(sum(closes[i-19:i+1])/20.0, 2)})
-            if i >= 49: sma50.append({"time": bars[i]["time"], "value": round(sum(closes[i-49:i+1])/50.0, 2)})
-
-        # Fundamental score
-        eq = data["total_equity_cur"]
-        shares = data["shares"]
-        pe = price_used / data["eps_cur"] if data["eps_cur"] > 0 else 999.0
-        bvps = eq / shares if shares > 0 else 0
-        graham_num = round(math.sqrt(22.5 * data["eps_cur"] * bvps), 1) if data["eps_cur"] > 0 and bvps > 0 else None
-        graham_margin = round(((graham_num - price_used) / price_used * 100), 1) if graham_num else None
-        
-        latest_c = bars[-1]["close"] if bars else price_used
-        
-        if sym in ["FFC", "SYS", "MEBL", "MCB", "UBL", "MARI", "INDU"]:
-            action = "VALUE BUY" if (graham_margin and graham_margin > 15) else "ACCUMULATE"
-            badge = "badge-value-buy" if "VALUE" in action else "badge-accumulate"
-            score = 8.5
-        elif sym in ["LUCK", "HUBC", "PPL", "SEARL", "ILP"]:
-            action = "VALUE BUY"
-            badge = "badge-value-buy"
-            score = 7.8
-        elif sym == "ENGRO":
-            action = "MOMENTUM BUY"
-            badge = "badge-momentum"
-            score = 7.3
-        elif sym == "OGDC":
-            action = "HOLD / WATCH"
-            badge = "badge-hold"
-            score = 8.5
-        else:
-            action = "SELL / AVOID"
-            badge = "badge-sell"
-            score = 2.2
-
-        t1 = round(latest_c * 1.10, 1)
-        t2 = round(graham_num if graham_num and graham_num > t1 else latest_c * 1.25, 1)
-        sl = round(latest_c * 0.94, 1)
-
-        trade_setup = {
-            "action": action,
-            "action_badge": badge,
-            "setup_name": "Official PSX Swing & Value Blueprint",
-            "entry_zone": f"Rs. {round(latest_c*0.98, 1)} – {round(latest_c*1.01, 1)}",
-            "target_1": f"Rs. {t1:,.2f} (+10.0%)",
-            "target_2": f"Rs. {t2:,.2f} (+25.0%)",
-            "stop_loss": f"Rs. {sl:,.2f} (-6.0%)",
-            "rr_ratio": "1 : 2.8",
-            "rationale": f"Official PSX trade signal. Fundamental Score: {score}/10."
-        }
-
-        markers = []
-        if len(bars) > 10:
-            markers.append({"time": bars[-1]["time"], "position": "belowBar", "color": "#10b981", "shape": "arrowUp", "text": action})
-
-        stock_record = {
-            "symbol": sym,
-            "name": data["name"],
-            "sector": data["sector"],
-            "price": price_used,
-            "overall_score": score,
-            "growth_passed": 9 if score >= 8 else 7 if score >= 7 else 2,
-            "growth_label": "EXCELLENT 💎" if score >= 8 else "STRONG ✅" if score >= 7 else "WEAK 🔴",
-            "piotroski_score": 9 if score >= 8 else 8 if score >= 7 else 2,
-            "piotroski_label": "Strong ✅" if score >= 7 else "Weak 🔴",
-            "altman_z": 3.42 if score >= 7 else 0.85,
-            "altman_label": "Safe ✅" if score >= 7 else "Risky 🔴",
-            "zmijewski": -2.85 if score >= 7 else 1.45,
-            "zmijewski_label": "Very Safe 💚" if score >= 7 else "Risky 🔴",
-            "graham_num": graham_num if graham_num else "N/A",
-            "graham_margin": graham_margin if graham_margin else "N/A",
-            "graham_label": "Cheap 🟢" if graham_margin and graham_margin > 15 else "Fair 🟡",
-            "peg": 0.65 if score >= 7 else 2.5,
-            "peg_label": "Excellent 🟢" if score >= 7 else "Expensive 🔴",
-            "current_ratio": 1.55,
-            "debt_to_equity": 0.35,
-            "roe_real": 22.5,
-            "roic": 26.8,
-            "warning": "Clean Balance Sheet" if score >= 7 else "High Debt & Negative Earnings",
-            "warning_class": "safe" if score >= 7 else "danger",
-            "trade_setup": trade_setup
-        }
-
-        evaluated.append(stock_record)
-        charts_data[sym] = {"bars": bars, "sma20": sma20, "sma50": sma50, "markers": markers, "trade_setup": trade_setup}
-
-    # 3. Incorporate all other 500+ stocks from the PSX full universe
-    audited_set = set(audited_symbols)
-    for u_stock in all_universe_stocks:
-        if u_stock["symbol"] not in audited_set:
-            evaluated.append(u_stock)
-
+    else:
+        print("[-] psx_full_universe.json missing. Run build_universe.py and copy the file here.")
     _market_cache["last_scanned"] = datetime.datetime.now(datetime.timezone.utc).strftime("%d-%b-%Y %H:%M:%S UTC")
-    _market_cache["stocks"] = sorted(evaluated, key=lambda x: x["overall_score"], reverse=True)
-    _market_cache["charts"] = charts_data
-    print(f"[+] Market scan complete: {len(evaluated)} PSX symbols cached (All {len(evaluated)} active stocks).")
+    _market_cache["stocks"] = stocks
+    _market_cache["charts"] = {}
+    print(f"[+] Loaded {len(stocks)} stocks from psx_full_universe.json")
 
-# Run scan on server boot
+# Run on server boot
 scan_official_psx_market()
 
 # ────────────────────────────────────────────────────────────────────
@@ -512,10 +404,16 @@ async def admin_login_page(request: Request):
 
 @app.post("/admin/login")
 async def admin_login_submit(request: Request, response: Response, username: str = Form(...), password: str = Form(...)):
-    if username == ADMIN_USER and password == ADMIN_PASSWORD:
+    key = "admin:" + _client_ip(request)
+    if _locked(key):
+        return HTMLResponse("<h3>Too many attempts. Try again in 15 minutes.</h3>", status_code=429)
+    ok_user = _same(username, ADMIN_USER)
+    ok_pass = _same(password, ADMIN_PASSWORD)
+    if ok_user and ok_pass:
         res = RedirectResponse(url="/admin", status_code=status.HTTP_302_FOUND)
         create_admin_session(res)
         return res
+    _fail(key)
     return HTMLResponse("<h3>Invalid username or password. <a href='/admin/login'>Try again</a></h3>", status_code=401)
 
 @app.get("/admin/logout")
@@ -556,19 +454,19 @@ async def admin_dashboard(request: Request):
 
         user_list.append({
             "id": u["id"],
-            "email": u["email"],
-            "name": u["name"] or "—",
-            "plan": u["plan"],
+            "email": _html.escape(u["email"]),
+            "name": _html.escape(u["name"] or "—"),
+            "plan": _html.escape(u["plan"] or ""),
             "created_at": datetime.datetime.fromisoformat(u["created_at"]).strftime("%d-%b-%Y"),
             "expires_at": exp_dt.strftime("%d-%b-%Y"),
             "days_left": days_left,
             "status_text": status_text,
             "status_color": status_color,
-            "notes": u["notes"] or "—",
+            "notes": _html.escape(u["notes"] or "—"),
             "is_active": u["is_active"]
         })
 
-    users_json = json.dumps(user_list)
+    users_json = json.dumps(user_list).replace("</", "<\\/")
     last_scanned = _market_cache["last_scanned"] or "Just now"
 
     return f"""<!DOCTYPE html>
@@ -944,11 +842,14 @@ class LoginRequest(BaseModel):
     password: str
 
 @app.post("/api/login")
-async def client_login(payload: LoginRequest):
+async def client_login(payload: LoginRequest, request: Request):
     email = payload.email.lower().strip()
+    _key = "login:" + _client_ip(request) + ":" + email
+    if _locked(_key):
+        return JSONResponse(status_code=429, content={"status": "error", "message": "Too many failed attempts. Try again in 15 minutes."})
 
     # 1. Direct Master Admin Login Bypass
-    if (email == ADMIN_USER.lower() or email == f"{ADMIN_USER.lower()}@crtalgo.online") and payload.password == ADMIN_PASSWORD:
+    if (email == ADMIN_USER.lower() or email == f"{ADMIN_USER.lower()}@crtalgo.online") and _same(payload.password, ADMIN_PASSWORD):
         token = "admin_" + secrets.token_urlsafe(32)
         with get_db() as conn:
             admin_row = conn.execute("SELECT id FROM users WHERE email = 'admin@crtalgo.online'").fetchone()
@@ -964,7 +865,7 @@ async def client_login(payload: LoginRequest):
             else:
                 admin_id = admin_row["id"]
 
-            token_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
+            token_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
             conn.execute("INSERT INTO client_tokens (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
                          (token, admin_id, datetime.datetime.now(datetime.timezone.utc).isoformat(), token_exp.isoformat()))
             conn.commit()
@@ -985,10 +886,12 @@ async def client_login(payload: LoginRequest):
     with get_db() as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
         if not row:
-            return JSONResponse(status_code=401, content={"status": "error", "message": "Account not found. Please contact admin."})
+            _fail(_key)
+            return JSONResponse(status_code=401, content={"status": "error", "message": "Invalid email or password."})
 
         if not verify_password(payload.password, row["password_hash"], row["salt"]):
-            return JSONResponse(status_code=401, content={"status": "error", "message": "Incorrect password."})
+            _fail(_key)
+            return JSONResponse(status_code=401, content={"status": "error", "message": "Invalid email or password."})
 
         if row["is_active"] != 1:
             return JSONResponse(status_code=403, content={"status": "error", "message": "Your account has been paused by administrator. Please contact support."})
@@ -1049,8 +952,10 @@ async def client_market_data(authorization: Optional[str] = Header(None)):
     }
 
 @app.get("/api/chart/{symbol}")
-async def get_stock_chart(symbol: str):
-    sym = symbol.upper().strip()
+async def get_stock_chart(symbol: str, authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer ") or not verify_client_token(authorization.split(" ", 1)[1]):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    sym = re.sub(r"[^A-Z0-9]", "", symbol.upper())[:12]
     if sym in _market_cache["charts"]:
         return {"status": "success", "chart": _market_cache["charts"][sym]}
     
@@ -1078,9 +983,8 @@ async def get_stock_chart(symbol: str):
                         close_p = round(float(d[1]), 2)
                         vol = int(d[2] or 0)
                         open_p = round(float(d[3] if len(d) > 3 and d[3] is not None else d[1]), 2)
-                        spread = abs(close_p - open_p) * 0.35
-                        high_p = round(max(open_p, close_p) + max(spread, close_p * 0.005), 2)
-                        low_p = round(min(open_p, close_p) - max(spread, close_p * 0.005), 2)
+                        high_p = round(max(open_p, close_p), 2)     # PSX EOD feed has no high/low: do not invent wicks
+                        low_p = round(min(open_p, close_p), 2)
                         bars.append({"time": dt, "open": open_p, "high": high_p, "low": low_p, "close": close_p, "volume": vol})
                     bars = sorted(bars, key=lambda x: x["time"])
                     

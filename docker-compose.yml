@@ -1,0 +1,28 @@
+# One compose file only (delete docker-compose.yaml — it was a duplicate with the same secrets).
+# No secret has a default: the container will not start unless you set them
+# in Coolify -> Environment Variables (or an untracked .env file for local use).
+services:
+  psx-fds-server:
+    build: .
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set (min 12 chars)}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set (min 32 random chars)}
+      - COOKIE_SECURE=${COOKIE_SECURE:-1}
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      - DATA_DIR=/app/data
+    volumes:
+      - psx_data:/app/data
+    networks:
+      - coolify
+
+volumes:
+  psx_data:
+    driver: local
+
+networks:
+  coolify:
+    external: true
